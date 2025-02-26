@@ -2,6 +2,11 @@
 #DELETE embed from shorts links it processes, 
 #detect if video filesize will be larger than 25MB
 
+
+#abstracts api for Ollama and openrouter use case
+from api1 import API1
+from api2 import API2
+
 import requests
 import json
 import subprocess
@@ -11,6 +16,42 @@ import discord
 from dotenv import load_dotenv
 from pytube import YouTube
 from discord.ext import commands
+
+#the following is the api logic for swtiching between two apis
+
+
+# 1. Bot Context Class (handles the bot's interaction with the API)
+class BotContext:
+    def __init__(self, api):
+        self.api = api
+
+    def fetch_data(self):
+        return self.api.fetch_data()
+
+    def send_data(self, data):
+        return self.api.send_data(data)
+
+# 2. API Switching Logic
+def switch_api(api_name: str):
+    """Switch between API implementations based on the config or input"""
+    if api_name == "API1":
+        return API1()
+    elif api_name == "API2":
+        return API2()
+    else:
+        raise ValueError(f"API '{api_name}' not supported.")
+
+# 3. Optional: Load Configuration from JSON (or Environment Variable)
+def load_configuration():
+    """Simulate loading configuration to decide which API to use"""
+    try:
+        with open('config.json', 'r') as config_file:
+            config = json.load(config_file)
+            return config.get('api_choice', 'API1')  # Default to API1 if not set
+    except FileNotFoundError:
+        print("Configuration file not found. Defaulting to API1.")
+        return "API1"  # Default to API1 if config file is not found
+
 
 # Load environment variables from .env file
 load_dotenv()
