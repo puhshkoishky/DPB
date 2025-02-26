@@ -1,37 +1,69 @@
-#TODO: 
-#DELETE embed from shorts links it processes, 
-#detect if video filesize will be larger than 25MB
-
-import requests
-import json
+import os
 import subprocess
 import glob
-import os
 import discord
+from discord.ext import commands
 from dotenv import load_dotenv
 from pytube import YouTube
-from discord.ext import commands
+import ollama
+import re
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Get API keys and tokens from environment variables
-api_key = os.getenv("OPENROUTER_API_KEY")
 discord_token = os.getenv("DISCORD_TOKEN")
-
-# URL for OpenRouter API
-url = "https://openrouter.ai/api/v1/chat/completions"
-
-# Set authorization headers
-headers = {
-    "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json",
-}
 
 # Discord bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Directory for downloading videos
+directory = '/root/ytshortsbot/FileCache/'
+
+# Perform Review function using Ollama (interface similar to PerformReview)
+def PerformReview(text, model="deepseek-r1:7b", max_length=300):
+    """
+    Generate a performance review using Ollama's LLM.
+    """
+    try:
+        # Ensure text is within the model's processing limit
+        truncated_text = text[:max_length]
+
+        # Construct the prompt
+        prompt = f"Provide a one hundred word performance review along with a rating from 1-10 based on the following:\n\n{truncated_text}"
+
+        # Send request to Ollama
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        # Clean the response by removing <think> tags (if any)
+        full_response = response.get("message", {}).get("content", "").strip()
+        cleaned_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL).strip()
+
+        return cleaned_response
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return "An error occurred while generating the review."
+
+# Summarize text function
+def summarize_text(text):
+    """
+    Summarizes the provided text using Deepseek R1 via Ollama.
+    """
+    prompt = f"Summarize the following text briefly:\n\n{text}"
+    
+    response = ollama.chat(
+        model="deepseek-r1:7b",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    summary = response["message"]["content"].strip()
+    return summary
 
 # Event: When the bot is ready
 @bot.event
@@ -42,15 +74,8 @@ async def on_ready():
 @bot.command()
 async def ping(ctx):
     await ctx.send("pong!")
-    
-# Command: Saves the user's thoughts into thoughts.txt
-@bot.command()
-async def thoughts(ctx, *, thought: str):
-    with open("thoughts.txt", "a") as file:
-        file.write(f"user {ctx.author}: {thought}\n")
-    await ctx.send(f"Your thought has been saved, {ctx.author}!")
 
-# Command: Summarizes the thoughts of a specific user using LLM
+# Command: Summarizes a user's thoughts using Ollama
 @bot.command()
 async def opinions(ctx, *, username: str):
     user_thoughts = []
@@ -64,21 +89,9 @@ async def opinions(ctx, *, username: str):
         return
 
     thoughts_text = "\n".join(user_thoughts)
-    prompt = f"For user {username}, summarize their opinions in 20 words or less: {thoughts_text}"
-    data = {
-        "model": "deepseek/deepseek-r1:free",
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    summary = summarize_text(thoughts_text)
 
-    response = requests.post(url, headers=headers, json=data)
-
-    if response.status_code == 200:
-        summary = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        with open("LLMthoughts.txt", "a") as summary_file:
-            summary_file.write(f"Summary for {username}:\n{summary}\n\n")
-        await ctx.send(f"Summary of {username}'s thoughts:\n{summary}")
-    else:
-        await ctx.send("Sorry, there was an error summarizing the thoughts.")
+    await ctx.send(f"Summary of {username}'s thoughts:\n{summary}")
 
 # Event: Listen for messages containing certain text
 @bot.event
@@ -98,7 +111,6 @@ async def on_message(message):
                 await message.edit(embed=embed)
 
         # Download YouTube Shorts video
-        directory = '/root/ytshortsbot/FileCache/'
         shortURL = message.content
         os.chdir(directory)
 
@@ -117,6 +129,14 @@ async def on_message(message):
             # Delete the file after sending
             if os.path.exists(vidFiles[0]):
                 os.remove(vidFiles[0])
+
+            # Optionally, you can generate a performance review or summary of the video description (via Ollama)
+            video = YouTube(shortURL)
+            description = video.description
+            summary = summarize_text(description)
+
+            await message.channel.send(f"Summary of video description:\n{summary}")
+
         else:
             await message.channel.send("Error downloading the video.")
 
@@ -125,4 +145,3 @@ async def on_message(message):
 
 # Run the bot with the token from the .env file
 bot.run(discord_token)
-
