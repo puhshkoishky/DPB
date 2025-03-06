@@ -1,9 +1,18 @@
+# =================================================================================
+#                                 IMPORTING THE TOOLBOX
+# =================================================================================
 import discord
 from discord.ext import commands
+from discord import app_commands
+import sqlite3
+import math
+from datetime import datetime
+import ollama
+import re
+from itertools import groupby
 import os
 import requests
 import json
-import sqlite3
 import subprocess
 import glob
 from pytube import YouTube
@@ -15,119 +24,439 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not DISCORD_BOT_TOKEN:
     print("Error: DISCORD_BOT_TOKEN is missing!")
 
-# Initialize bot with intents
+# =================================================================================
+#                                 THE BOT'S BRAIN: CLIENT CLASS
+# =================================================================================
+class Client(commands.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.db_conn = sqlite3.connect('WideShmeerBackend.db')
+        self.initialize_database()
+
+    def initialize_database(self):
+        cursor = self.db_conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                preferred_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                phone_number TEXT NOT NULL,
+                degree_major TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS availability (
+                user_id TEXT,
+                day_of_week TEXT CHECK(day_of_week IN (
+                    'Monday', 'Tuesday', 'Wednesday', 
+                    'Thursday', 'Friday', 'Saturday', 'Sunday'
+                )),
+                start_time TEXT,
+                end_time TEXT,
+                PRIMARY KEY (user_id, day_of_week),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS common_availability (
+                day_of_week TEXT,
+                start_time TEXT,
+                end_time TEXT,
+                PRIMARY KEY (day_of_week, start_time, end_time)
+            )
+        ''')
+        self.db_conn.commit()
+
+    def time_to_minutes(self, time_str):
+        if time_str == 'N/A':
+            return None
+        hours, minutes = map(int, time_str.split(':'))
+        return hours * 60 + minutes
+
+    def minutes_to_time(self, minutes):
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours:02d}:{mins:02d}"
+
+    def update_common_availability(self):
+        """
+        Compute common availability for each day using a sweep-line approach.
+        A common time slot is one during which at least 75% (rounded up) of the users
+        with valid availability for that day are available.
+        This version groups events that occur at the same time and sorts events by time
+        and by the change value (ensuring end events are processed before start events
+        when they occur at the same timestamp) to correctly compute intersections.
+        """
+        cursor = self.db_conn.cursor()
+        
+        days_of_week = ['Monday', 'Tuesday', 'Wednesday', 
+                        'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+        for day in days_of_week:
+            cursor.execute('''
+                SELECT start_time, end_time 
+                FROM availability 
+                WHERE day_of_week = ? 
+                    AND start_time != 'N/A' 
+                    AND end_time != 'N/A'
+            ''', (day,))
+            intervals = []
+            for start, end in cursor.fetchall():
+                start_min = self.time_to_minutes(start)
+                end_min = self.time_to_minutes(end)
+                if start_min is not None and end_min is not None:
+                    intervals.append((start_min, end_min))
+            
+            # Calculate the threshold based only on users with valid availability for this day.
+            valid_users = len(intervals)
+            common_slots = []
+            if valid_users > 0:
+                required = math.ceil(0.75 * valid_users)
+                # Build a list of events: +1 for a start, -1 for an end.
+                events = []
+                for s, e in intervals:
+                    events.append((s, +1))
+                    events.append((e, -1))
+                # Sort events by time and then by -change (ensuring end events come before start events).
+                events.sort(key=lambda x: (x[0], -x[1]))
+
+                current_active = 0
+                common_start = None
+
+                # Group events with the same timestamp.
+                for time, group in groupby(events, key=lambda x: x[0]):
+                    delta = sum(change for _, change in group)
+                    previous_active = current_active
+                    current_active += delta
+
+                    # When crossing the threshold upwards, mark the start.
+                    if previous_active < required and current_active >= required:
+                        common_start = time
+                    # When dropping below threshold, mark the end.
+                    elif previous_active >= required and current_active < required and common_start is not None:
+                        common_slots.append((common_start, time))
+                        common_start = None
+                # Close any slot that remains open.
+                if common_start is not None:
+                    common_slots.append((common_start, 1440))
+            
+            # Clear existing common availability for the day.
+            cursor.execute("DELETE FROM common_availability WHERE day_of_week = ?", (day,))
+            # Insert the computed common slots.
+            for start, end in common_slots:
+                cursor.execute('''
+                    INSERT INTO common_availability (day_of_week, start_time, end_time)
+                    VALUES (?, ?, ?)
+                ''', (day, self.minutes_to_time(start), self.minutes_to_time(end)))
+        self.db_conn.commit()
+
+    async def on_ready(self):
+        print(f'Bot logged in as {self.user}!')
+        try:
+            # Replace with your actual server ID
+            guild = discord.Object(id=1329218811383251025)
+            synced = await self.tree.sync(guild=guild)
+            print(f'Successfully connected {len(synced)} commands to server')
+        except Exception as e:
+            print(f'Command sync error: {e}')
+
+    async def on_message(self, message):
+        if message.author == self.user:
+            return
+        print(f'Message from {message.author}: {message.content}')
+        # Uncomment the next line if you use prefix commands:
+        # await self.process_commands(message)
+
+# =================================================================================
+#                                 SETTING UP BOT PERMISSIONS
+# =================================================================================
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+client = Client(command_prefix="!", intents=intents)
+# Replace with your actual server ID
+GUILD_ID = discord.Object(id=1329218811383251025)
 
-# Discord message limit
-DISCORD_MESSAGE_LIMIT = 2000
+# =================================================================================
+#                                 USER COMMANDS (SLASH COMMANDS)
+# =================================================================================
+@client.tree.command(
+    name="register", 
+    description="Save your name, contact info, and major",
+    guild=GUILD_ID
+)
+@app_commands.describe(
+    preferred_name="What you like to be called",
+    email="Your email address",
+    phone="Your phone number",
+    major="Your study program (e.g., 'Computer Science')"
+)
+async def register(interaction: discord.Interaction, preferred_name: str, email: str, phone: str, major: str):
+    user_id = str(interaction.user.id)
+    try:
+        cursor = client.db_conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users 
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, preferred_name, email, phone, major))
+        
+        days = ['Monday', 'Tuesday', 'Wednesday', 
+                'Thursday', 'Friday', 'Saturday', 'Sunday']
+        for day in days:
+            cursor.execute('''
+                INSERT OR IGNORE INTO availability 
+                VALUES (?, ?, 'N/A', 'N/A')
+            ''', (user_id, day))
+        client.db_conn.commit()
+        await interaction.response.send_message("✅ Successfully registered!")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Registration failed: {str(e)}")
 
-# Local DeepSeek R1 via Ollama
-def ask_ollama(user_message):
-    url = "http://localhost:11434/api/generate"
-    data = {"model": "deepseek-r1:1.5b", "prompt": user_message, "stream": False}
+@client.tree.command(
+    name="set_availability", 
+    description="Update your available times for a day (use N/A for unavailable)",
+    guild=GUILD_ID
+)
+@app_commands.describe(
+    day="Select a day",
+    start_time="Start time (HH:MM or N/A)",
+    end_time="End time (HH:MM or N/A)"
+)
+@app_commands.choices(day=[
+    app_commands.Choice(name=d, value=d)
+    for d in ['Monday', 'Tuesday', 'Wednesday', 
+              'Thursday', 'Friday', 'Saturday', 'Sunday']
+])
+async def set_availability(interaction: discord.Interaction, day: str, start_time: str, end_time: str):
+    user_id = str(interaction.user.id)
+    start_time = start_time.upper()
+    end_time = end_time.upper()
+
+    if start_time == 'N/A' or end_time == 'N/A':
+        if start_time != end_time:
+            await interaction.response.send_message("❌ Both times must be N/A to mark unavailable")
+            return
+        start_time = end_time = 'N/A'
+    else:
+        try:
+            datetime.strptime(start_time, "%H:%M")
+            datetime.strptime(end_time, "%H:%M")
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid format. Use HH:MM or N/A")
+            return
 
     try:
-        response = requests.post(url, json=data)
-        if response.status_code == 200:
-            full_response = response.json().get("response", "No response received.")
-            return [full_response[i : i + DISCORD_MESSAGE_LIMIT] for i in range(0, len(full_response), DISCORD_MESSAGE_LIMIT)]
-        return [f"Error: {response.status_code} - {response.text}"]
-    except requests.exceptions.RequestException as e:
-        return [f"Request failed: {e}"]
-
-# Feedback database setup
-conn = sqlite3.connect("feedback.db")
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS feedback (user_id TEXT, username TEXT, message TEXT)")
-conn.commit()
-
-# Bot Ready Event
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user}')
-
-# Ping Command
-@bot.command()
-async def ping(ctx):
-    await ctx.send("pong!")
-
-# Save User Thoughts
-@bot.command()
-async def thoughts(ctx, *, thought: str):
-    with open("thoughts.txt", "a") as file:
-        file.write(f"user {ctx.author}: {thought}\n")
-    await ctx.send(f"Your thought has been saved, {ctx.author}!")
-
-# Summarize User Thoughts using DeepSeek API
-@bot.command()
-async def opinions(ctx, *, username: str):
-    user_thoughts = []
-    with open("thoughts.txt", "r") as file:
-        user_thoughts = [line.strip() for line in file if f"user {username}:" in line]
-
-    if not user_thoughts:
-        await ctx.send(f"No thoughts found for {username}.")
-        return
-
-    thoughts_text = "\n".join(user_thoughts)
-    prompt = f"For user {username}, summarize their opinions in 20 words or less: {thoughts_text}"
-    
-    data = {"model": "deepseek-r1:1.5b", "prompt": prompt, "stream": False}
-    response = requests.post("http://localhost:11434/api/generate", json=data)
-
-    if response.status_code == 200:
-        summary = response.json().get("response", "Error generating summary.")
-        with open("LLMthoughts.txt", "a") as summary_file:
-            summary_file.write(f"Summary for {username}:\n{summary}\n\n")
-        await ctx.send(f"Summary of {username}'s thoughts:\n{summary}")
-    else:
-        await ctx.send("Error summarizing the thoughts.")
-
-# Ask DeepSeek LLM
-@bot.command(name="ask")
-async def ask(ctx, *, user_message: str):
-    responses = ask_ollama(user_message)
-    for response in responses:
-        await ctx.send(response)
-
-# Detect Large YouTube Videos & Remove Shorts Embeds
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-
-    # Remove YouTube Shorts embeds
-    if 'shorts' in message.content.lower():
-        await message.channel.send(f"Hi {message.author.mention}, Morgi doesn't like 'shorts'!")
-        for embed in message.embeds:
-            embed.url = None
-            await message.edit(embed=embed)
-
-        # YouTube Download Handling
-        shortURL = message.content
-        directory = "/root/ytshortsbot/FileCache/"
-        os.chdir(directory)
-        result = subprocess.run(['/root/ytshortsbot/venv/bin/yt-dlp', shortURL], capture_output=True, text=True)
-
-        if result.returncode == 0:
-            vidFiles = glob.glob(os.path.join(directory, "*"))
-            video_path = vidFiles[0]
-
-            # Check if video file size is under 25MB before sending
-            if os.path.getsize(video_path) > 25 * 1024 * 1024:
-                await message.channel.send("Error: Video file is larger than 25MB and cannot be sent.")
-            else:
-                await message.channel.send(file=discord.File(video_path))
-
-            # Cleanup sent file
-            if os.path.exists(video_path):
-                os.remove(video_path)
+        cursor = client.db_conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO availability 
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, day, start_time, end_time))
+        client.db_conn.commit()
+        client.update_common_availability()
+        
+        if start_time == 'N/A':
+            await interaction.response.send_message(f"✅ Marked {day} as unavailable")
         else:
-            await message.channel.send("Error downloading YouTube Shorts video.")
+            await interaction.response.send_message(f"✅ {day} availability set to {start_time}-{end_time}")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {str(e)}")
 
-    await bot.process_commands(message)
+@client.tree.command(
+    name="view_common", 
+    description="Show time slots available to 75%+ users",
+    guild=GUILD_ID
+)
+async def view_common(interaction: discord.Interaction):
+    cursor = client.db_conn.cursor()
+    cursor.execute('''
+        SELECT day_of_week, start_time, end_time 
+        FROM common_availability 
+        ORDER BY 
+            CASE day_of_week
+                WHEN 'Monday' THEN 1
+                WHEN 'Tuesday' THEN 2
+                WHEN 'Wednesday' THEN 3
+                WHEN 'Thursday' THEN 4
+                WHEN 'Friday' THEN 5
+                WHEN 'Saturday' THEN 6
+                WHEN 'Sunday' THEN 7
+            END,
+            start_time
+    ''')
+    
+    common_slots = cursor.fetchall()
+    
+    if not common_slots:
+        await interaction.response.send_message("No common time slots available")
+        return
+    
+    schedule = {}
+    for day, start, end in common_slots:
+        if day not in schedule:
+            schedule[day] = []
+        schedule[day].append(f"{start} - {end}")
+    
+    response = ["**Common Availability (75%+ Users Free)**"]
+    days_order = ['Monday', 'Tuesday', 'Wednesday', 
+                    'Thursday', 'Friday', 'Saturday', 'Sunday']
+    
+    for day in days_order:
+        if day in schedule:
+            times = "\n".join(schedule[day])
+            response.append(f"\n**{day}:**\n{times}")
+        else:
+            response.append(f"\n**{day}:** No common slots")
+    
+    await interaction.response.send_message("\n".join(response))
 
-# Run Bot
-bot.run(DISCORD_BOT_TOKEN)
+@client.tree.command(
+    name="my_info", 
+    description="View your registered information",
+    guild=GUILD_ID
+)
+async def my_info(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    cursor = client.db_conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = cursor.fetchone()
+    
+    if user:
+        response = (
+            "**Your Information**\n"
+            f"Name: {user[1]}\n"
+            f"Email: {user[2]}\n"
+            f"Phone: {user[3]}\n"
+            f"Major: {user[4]}"
+        )
+    else:
+        response = "❌ You're not registered! Use `/register` first"
+    await interaction.response.send_message(response)
+
+@client.tree.command(
+    name="add_event", 
+    description="Add an event reminder",
+    guild=GUILD_ID
+)
+@app_commands.describe(
+    event_name="Name of the event",
+    event_date="Date of the event (YYYY-MM-DD)",
+    event_time="Time of the event (HH:MM in 24-hour format)"
+)
+async def add_event(interaction: discord.Interaction, event_name: str, event_date: str, event_time: str):
+    user_id = str(interaction.user.id)
+    
+    # Validate date and time formats
+    try:
+        datetime.strptime(event_date, "%Y-%m-%d")
+        datetime.strptime(event_time, "%H:%M")
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid date or time format. Use YYYY-MM-DD for date and HH:MM (24-hour) for time.")
+        return
+
+    try:
+        cursor = client.db_conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                user_id TEXT,
+                event_name TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                PRIMARY KEY (user_id, event_name, event_date, event_time),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO events (user_id, event_name, event_date, event_time)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, event_name, event_date, event_time))
+        client.db_conn.commit()
+        await interaction.response.send_message(f"✅ Event '{event_name}' added for {event_date} at {event_time}.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error adding event: {str(e)}")
+
+@client.tree.command(
+    name="view_events", 
+    description="View your upcoming events",
+    guild=GUILD_ID
+)
+async def view_events(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    cursor = client.db_conn.cursor()
+    cursor.execute('''
+        SELECT event_name, event_date, event_time 
+        FROM events 
+        WHERE user_id = ? 
+        ORDER BY event_date, event_time
+    ''', (user_id,))
+    
+    events = cursor.fetchall()
+    
+    if not events:
+        await interaction.response.send_message("📅 You have no upcoming events.")
+        return
+    
+    response = ["**Your Upcoming Events:**"]
+    for name, date, time in events:
+        response.append(f"📌 **{name}** - {date} at {time}")
+    
+    await interaction.response.send_message("\n".join(response))
+
+@client.tree.command(
+    name="delete_event", 
+    description="Delete an event reminder",
+    guild=GUILD_ID
+)
+@app_commands.describe(
+    event_name="Name of the event to delete",
+    event_date="Date of the event (YYYY-MM-DD)"
+)
+async def delete_event(interaction: discord.Interaction, event_name: str, event_date: str):
+    user_id = str(interaction.user.id)
+
+    try:
+        cursor = client.db_conn.cursor()
+        cursor.execute('''
+            DELETE FROM events 
+            WHERE user_id = ? AND event_name = ? AND event_date = ?
+        ''', (user_id, event_name, event_date))
+        client.db_conn.commit()
+
+        if cursor.rowcount > 0:
+            await interaction.response.send_message(f"🗑️ Event '{event_name}' on {event_date} deleted successfully.")
+        else:
+            await interaction.response.send_message("❌ Event not found.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error deleting event: {str(e)}")
+
+# =================================================================================
+#                                 AI REVIEW FEATURE
+# =================================================================================
+def LLMReviewRequest(text, model="deepseek-r1:7b", max_length=300):
+    try:
+        truncated_text = text[:max_length]
+        prompt = f"Provide a 100-word performance review with 1-10 rating based on:\n\n{truncated_text}"
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        full_response = response.get("message", {}).get("content", "").strip()
+        cleaned_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL).strip()
+        return cleaned_response
+    except Exception as e:
+        print(f"AI Service Error: {e}")
+        return "⚠️ Our AI is currently unavailable. Please try again later!"
+
+@client.tree.command(
+    name="perform_review", 
+    description="Get AI feedback on your text (max 300 words)",
+    guild=GUILD_ID
+)
+async def perform_review(interaction: discord.Interaction, description: str):
+    await interaction.response.defer()
+    review = LLMReviewRequest(description)
+    await interaction.followup.send(f'**AI Review:**\n{review}')
+
+# =================================================================================
+#                                 STARTING THE BOT ENGINE
+# =================================================================================
+# Replace the placeholder with your actual bot token
+client.run(DISCORD_BOT_TOKEN)
